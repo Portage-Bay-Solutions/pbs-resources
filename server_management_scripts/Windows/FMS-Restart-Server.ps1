@@ -8,11 +8,12 @@
 # Both arguments are required. The script will:
 #   1. Detect whether FileMaker Server is running
 #   2. Disconnect all clients (with retries)
-#   3. Close all hosted databases (with retries)
+#   3. Close all hosted databases and wait for them to finish closing
 #   4. Restart the server
 #
-# If any step fails, the script attempts to reopen databases and exits
-# without restarting.
+# If databases fail to close, the script attempts to reopen them and exits
+# without restarting. Clients that never disconnect are logged as a warning
+# only -- once every file is closed they are effectively evicted.
 #
 # If FileMaker Server is not installed/running, the script performs a
 # plain restart with no FMS steps.
@@ -39,7 +40,11 @@ if (-not $script:AdminUser -or -not $script:AdminPW) {
 
 $FMSAdminPath = 'C:\Program Files\FileMaker\FileMaker Server\Database Server\fmsadmin.exe'
 $MaxRetries = 10
-$RetryInterval = 4
+$FileCloseMaxRetries = 10
+$ClientRetryInterval = 15
+$FileRetryInterval = 30
+$FMSReachableRetries = 3
+$FMSReachableRetryInterval = 10
 $LogDir = 'C:\ProgramData\fms_restart'
 $LogFile = Join-Path $LogDir 'fms_shutdown.log'
 $LockFile = Join-Path $env:TEMP 'fms_restart_server.lock'
@@ -227,8 +232,8 @@ function Disconnect-Clients {
         }
 
         Write-Log "Disconnecting clients (attempt $attempt/$MaxRetries). Client IDs: $($clients -join ', ')"
-        Invoke-FMSCommand -Arguments @('disconnect', 'client', '-y') | Out-Null
-        Start-Sleep -Seconds $RetryInterval
+        Invoke-FMSCommand -Arguments @('disconnect', 'client', '-y', '-t', '5') | Out-Null
+        Start-Sleep -Seconds $ClientRetryInterval
     }
 
     $remainingClients = @(Get-CurrentClients)
@@ -242,15 +247,13 @@ function Disconnect-Clients {
 
 function Get-OpenFiles {
     param([switch]$Silent)
-    $result = Invoke-FMSCommand -Arguments @('list', 'files', '-s') -Silent:$Silent
+    # No -s: it also lists Closed files, which would never let the poll reach 0.
+    $result = Invoke-FMSCommand -Arguments @('list', 'files') -Silent:$Silent
     $fileIds = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in ($result.StdOut -split "`r?`n")) {
         if ($line -match '^\s*(\d+)\b') {
-            $fileId = $Matches[1]
-            if ($line -match '\bNormal\b') {
-                [void]$fileIds.Add($fileId)
-            }
+            [void]$fileIds.Add($Matches[1])
         }
     }
 
@@ -259,7 +262,9 @@ function Get-OpenFiles {
 }
 
 function Close-AllFiles {
-    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+    $closeIssued = $false
+
+    for ($attempt = 1; $attempt -le $FileCloseMaxRetries; $attempt++) {
         $files = @(Get-OpenFiles)
         if ($files.Count -eq 0) {
             Write-Log 'No open databases remain.'
@@ -267,9 +272,28 @@ function Close-AllFiles {
             return $true
         }
 
-        Write-Log "Closing databases (attempt $attempt/$MaxRetries). File IDs: $($files -join ', ')"
-        Invoke-FMSCommand -Arguments @('close', '-y') | Out-Null
-        Start-Sleep -Seconds $RetryInterval
+        if (-not $closeIssued) {
+            Write-Log "Closing databases (attempt $attempt/$FileCloseMaxRetries). File IDs: $($files -join ', ')"
+            $result = Invoke-FMSCommand -Arguments @('close', '-y') -AllowFailure
+            if ($result.ExitCode -eq 0) {
+                $closeIssued = $true
+                $script:FilesWereClosed = $true
+            }
+            elseif ($result.ExitCode -eq 10904) {
+                # "No applicable files" -- files are already closing from a prior command.
+                Write-Log 'Files are already closing (10904). Waiting for flush to complete...'
+                $closeIssued = $true
+                $script:FilesWereClosed = $true
+            }
+            else {
+                throw "fmsadmin command failed: close -y (exit code $($result.ExitCode))."
+            }
+        }
+        else {
+            Write-Log "Waiting for $($files.Count) file(s) to finish closing (poll $attempt/$FileCloseMaxRetries)..."
+        }
+
+        Start-Sleep -Seconds $FileRetryInterval
     }
 
     $remainingFiles = @(Get-OpenFiles)
@@ -316,11 +340,18 @@ function Test-PendingReboot {
 }
 
 function Confirm-FMSReachable {
-    $result = Invoke-FMSCommand -Arguments @('list', 'files') -AllowFailure
-    if (-not $result.Success) {
-        throw "Cannot communicate with FileMaker Server (exit code $($result.ExitCode))."
+    for ($attempt = 1; $attempt -le $FMSReachableRetries; $attempt++) {
+        $result = Invoke-FMSCommand -Arguments @('list', 'files') -AllowFailure
+        if ($result.Success) {
+            Write-Log 'FileMaker Server is reachable.'
+            return
+        }
+        if ($attempt -lt $FMSReachableRetries) {
+            Write-Log "FMS admin API not responding (exit $($result.ExitCode)), attempt $attempt/$FMSReachableRetries. Retrying in ${FMSReachableRetryInterval}s..." 'WARN'
+            Start-Sleep -Seconds $FMSReachableRetryInterval
+        }
     }
-    Write-Log 'FileMaker Server is reachable.'
+    throw "Cannot communicate with FileMaker Server after $FMSReachableRetries attempt(s) (last exit code $($result.ExitCode))."
 }
 
 function Start-ForcedRestart {
@@ -365,8 +396,11 @@ try {
     $clientsOk = Disconnect-Clients
     $filesOk = Close-AllFiles
 
-    if (-not $clientsOk -or -not $filesOk) {
-        throw "Safe shutdown did not complete. Clients disconnected: $clientsOk. Files closed: $filesOk."
+    if (-not $filesOk) {
+        throw "Safe shutdown did not complete. Files closed: False."
+    }
+    if (-not $clientsOk) {
+        Write-Log 'Client disconnect did not complete gracefully, but all files are closed -- clients are effectively evicted. Proceeding with restart.' 'WARN'
     }
 
     $finalFiles = @(Get-OpenFiles -Silent)
